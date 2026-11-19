@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """megadl.py <mega file link> <output file>: fetch and decrypt one public MEGA file."""
 import base64, json, struct, sys, urllib.request
-from Crypto.Cipher import AES
-from Crypto.Util import Counter
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Util import Counter
+except ImportError:  # Debian and Ubuntu package it as Cryptodome
+    from Cryptodome.Cipher import AES
+    from Cryptodome.Util import Counter
 
 link, out = sys.argv[1], sys.argv[2]
 handle, key = link.split("/file/")[1].split("#")
