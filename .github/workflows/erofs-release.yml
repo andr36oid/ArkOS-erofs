@@ -1,0 +1,137 @@
+name: EROFS release
+
+# Started by hand for one ArkOS-R3XS release. Publishing the result is what
+# declares that ArkOS version usable as a ready-made partition.
+#
+# ArkOS is discontinued upstream. Some of its last releases have the image on
+# GitHub (split .7z), the last one only on MEGA or Google Drive (.img.xz). For
+# those, give the link and the sha256 of the file it serves; the run stops when
+# the download does not match.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: ArkOS-R3XS release tag (for example ArkOS.V2.0.11072025)
+        required: true
+      revision:
+        description: Our revision of this conversion (raise it to publish again)
+        required: true
+        default: "1"
+      image_url:
+        description: Optional. Link to the image when the tag has none on GitHub (MEGA file link or plain https)
+        required: false
+        default: ""
+      image_sha256:
+        description: sha256 of the file behind image_url (required with image_url)
+        required: false
+        default: ""
+      prerelease:
+        description: Publish as a pre-release (installers only take full releases)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: AeolusUX/ArkOS-R3XS
+  DISTRIBUTION: ArkOS
+  UPSTREAM_TAG: ${{ inputs.tag }}
+  IMAGE_PREFIX: ArkOS_R3XS
+
+jobs:
+  convert:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: erofs
+      - name: Make room and install tools
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq erofs-utils p7zip-full e2fsprogs btrfs-progs attr fdisk xz-utils python3-pycryptodome
+          sudo modprobe erofs
+          df -h / /mnt
+      - name: Work out the version
+        run: |
+          # ArkOS tags end in the date as MMDDYYYY (ArkOS.V2.0.11072025,
+          # ArkOS.V2.0.07312025-1); andr36oid keeps versions as those 8 digits.
+          version=$(printf '%s\n' "${{ inputs.tag }}" | grep -o -E '[0-9]{8}' | tail -1)
+          [ -n "$version" ] || { echo "no 8-digit date in the tag" >&2; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$version-erofs${{ inputs.revision }}" >> "$GITHUB_ENV"
+      - name: Download the ArkOS release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_URL: ${{ inputs.image_url }}
+          IMAGE_SHA256: ${{ inputs.image_sha256 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dl"
+          cd "$RUNNER_TEMP/dl"
+          if [ -n "$IMAGE_URL" ]; then
+            case $IMAGE_SHA256 in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) [ ${#IMAGE_SHA256} = 64 ] ;;
+              *) false ;;
+            esac || { echo "image_url needs the 64-digit image_sha256" >&2; exit 1; }
+            case $IMAGE_URL in
+              https://mega.nz/file/*) python3 -I "$GITHUB_WORKSPACE/erofs/megadl.py" "$IMAGE_URL" download ;;
+              https://*) curl -fL --retry 3 -o download "$IMAGE_URL" ;;
+              *) echo "only https links" >&2; exit 1 ;;
+            esac
+            echo "$IMAGE_SHA256  download" | sha256sum -c -
+            # Name the file by what it is, so the unpack step knows what to do.
+            if xz -t download 2>/dev/null; then mv download "ArkOS_${VERSION}.img.xz"
+            else mv download "ArkOS_${VERSION}.7z"; fi
+          else
+            gh release download "${{ inputs.tag }}" --repo "$UPSTREAM" --dir . --pattern '*.7z*' --pattern '*.img.xz' --pattern '*.zip' || :
+            [ -n "$(ls)" ] || { echo "this tag has no image on GitHub: give image_url and image_sha256" >&2; exit 1; }
+            # GitHub publishes a sha256 for every release file: compare.
+            gh api "repos/$UPSTREAM/releases/tags/${{ inputs.tag }}" \
+              --jq '.assets[] | select(.digest != null) | "\(.digest | sub("^sha256:"; ""))  \(.name)"' > "$RUNNER_TEMP/digests"
+            for f in *; do
+              grep -q -F "  $f" "$RUNNER_TEMP/digests" || { echo "GitHub lists no sha256 for $f" >&2; exit 1; }
+            done
+            sha256sum -c "$RUNNER_TEMP/digests" --ignore-missing
+          fi
+          ls -la
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import hashlib, json, os
+          assets = []
+          for name in sorted(os.listdir(".")):
+              h = hashlib.sha256()
+              with open(name, "rb") as f:
+                  for block in iter(lambda: f.read(1 << 20), b""):
+                      h.update(block)
+              assets.append({"name": name, "size": os.path.getsize(name), "sha256": h.hexdigest()})
+          print("UPSTREAM_ASSETS=" + json.dumps(assets))
+          PY
+      - name: Unpack the disk image
+        run: |
+          cd "$RUNNER_TEMP/dl"
+          mkdir -p "$RUNNER_TEMP/img"
+          first=$(ls | sort | head -1)
+          case $first in
+            *.img.xz) xz -dc "$first" > "$RUNNER_TEMP/img/arkos.img" ;;
+            *) 7z l "$first" | tail -5
+               7z x -o"$RUNNER_TEMP/img" "$first" '*.img' -r ;;
+          esac
+          rm -f ./*
+          ls -la "$RUNNER_TEMP/img"
+          df -h /
+      - name: Convert and verify
+        run: |
+          image=$(find "$RUNNER_TEMP/img" -name '*.img' | head -1)
+          mkdir -p "$RUNNER_TEMP/out"
+          sudo --preserve-env=UPSTREAM,UPSTREAM_TAG,UPSTREAM_ASSETS,DISTRIBUTION,IMAGE_PREFIX bash erofs/convert.sh "$image" "$RUNNER_TEMP/out" "$VERSION" "${{ inputs.revision }}"
+          sudo chown -R "$USER" "$RUNNER_TEMP/out"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flag=""
+          [ "${{ inputs.prerelease }}" = "true" ] && flag="--prerelease"
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $flag \
+            --title "ArkOS $VERSION as EROFS (revision ${{ inputs.revision }})" \
+            --notes "The root filesystem of ArkOS-R3XS ${{ inputs.tag }}, unchanged, as a compressed read-only EROFS image for andr36oid. ArkOS is discontinued upstream. Packed with xz; manifest.json lists files, sizes and checksums." \
+            "$RUNNER_TEMP"/out/*
